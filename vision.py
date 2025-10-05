@@ -9,12 +9,15 @@ Author: VisionAssist MVP bootstrap
 
 import argparse
 import time
+import threading
 from collections import deque
 from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
+import speech_recognition as sr
+import pyttsx3
 
 # ---- YOLO (Ultralytics) ----
 from ultralytics import YOLO
@@ -41,8 +44,7 @@ def init_midas(device: torch.device, model_type: str = "DPT_Large"):
     """
     # The MiDaS repository exposes callables with names like
     # "MiDaS_small", "MiDaS", "DPT_Hybrid", "DPT_Large", etc.
-    # Older scripts often use names like "midas_v21_small" — map common
-    # CLI values to the actual hubcallable names here.
+    
     mt = model_type.strip()
     mt_l = mt.lower()
     if mt_l in ("midas_v21_small", "midas_small", "small", "midas_v21small"):
@@ -165,6 +167,56 @@ def run_yolo(model, frame_bgr, imgsz: int, conf: float, device: torch.device):
     return boxes
 
 
+# ---------- Color Detection ----------
+def detect_dominant_color(frame_bgr, x1, y1, x2, y2):
+    """
+    Detect the dominant color in a bounding box region.
+    Returns a color name string.
+    """
+    roi = frame_bgr[y1:y2, x1:x2]
+    if roi.size == 0:
+        return "unknown"
+    
+    # Convert to HSV for better color detection
+    roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    
+    # Get median color values to avoid noise
+    h = np.median(roi_hsv[:, :, 0])
+    s = np.median(roi_hsv[:, :, 1])
+    v = np.median(roi_hsv[:, :, 2])
+    
+    # Define color ranges in HSV
+    if v < 50:
+        return "black"
+    elif s < 50:
+        if v > 200:
+            return "white"
+        else:
+            return "gray"
+    elif h < 10 or h > 160:
+        return "red"
+    elif h < 25:
+        return "orange"
+    elif h < 35:
+        return "yellow"
+    elif h < 85:
+        return "green"
+    elif h < 130:
+        return "blue"
+    elif h < 160:
+        return "purple"
+    else:
+        return "red"
+
+
+def add_color_to_boxes(frame_bgr, boxes):
+    """Add color information to each detected box."""
+    for box in boxes:
+        color = detect_dominant_color(frame_bgr, box["x1"], box["y1"], box["x2"], box["y2"])
+        box["color"] = color
+    return boxes
+
+
 # ---------- Drawing / HUD ----------
 def put_text(img, text, org, scale=0.6, color=(255, 255, 255), thick=1, bg=True):
     if bg:
@@ -218,7 +270,10 @@ def draw_boxes(frame, boxes, depth=None, depth_near: float = 0.2, depth_far: flo
                     meters = float(depth_near)
                 b["depth_m"] = meters
 
-        label = f"{cls_name} {conf:.2f}"
+        # Build label with color, confidence, and depth
+        color = b.get("color", "")
+        label = f"{color} {cls_name} {conf:.2f}" if color else f"{cls_name} {conf:.2f}"
+        
         # If we computed numeric depth, append it as centimeters
         if "depth_m" in b:
             cm = int(round(b["depth_m"] * 100.0))
@@ -233,6 +288,184 @@ def draw_boxes(frame, boxes, depth=None, depth_near: float = 0.2, depth_far: flo
 def blend_depth(frame_bgr, depth_cm, alpha=0.55):
     depth_resized = cv2.resize(depth_cm, (frame_bgr.shape[1], frame_bgr.shape[0]), interpolation=cv2.INTER_LINEAR)
     return cv2.addWeighted(frame_bgr, 1 - alpha, depth_resized, alpha, 0)
+
+
+# ---------- Speech & Guidance ----------
+class VoiceAssistant:
+    """Handles speech recognition and text-to-speech for guiding users."""
+    
+    def __init__(self):
+        self.recognizer = sr.Recognizer()
+        self.microphone = sr.Microphone()
+        self.tts_engine = pyttsx3.init()
+        self.tts_engine.setProperty('rate', 150)  # Speed of speech
+        self.tts_engine.setProperty('volume', 1.0)  # Volume (0.0 to 1.0)
+        
+        self.search_query = None
+        self.search_color = None
+        self.search_object = None
+        self.is_listening = False
+        self.last_spoken_time = 0
+        self.min_speak_interval = 2.0  # Minimum seconds between spoken guidance
+        
+        # Adjust for ambient noise
+        print("[Voice] Adjusting for ambient noise...")
+        with self.microphone as source:
+            self.recognizer.adjust_for_ambient_noise(source, duration=1)
+        print("[Voice] Ready to listen. Press 's' to start search.")
+    
+    def speak(self, text, force=False):
+        """Speak text using TTS. Use force=True to bypass interval check."""
+        current_time = time.time()
+        if force or (current_time - self.last_spoken_time) >= self.min_speak_interval:
+            print(f"[Voice] Speaking: {text}")
+            self.tts_engine.say(text)
+            self.tts_engine.runAndWait()
+            self.last_spoken_time = current_time
+    
+    def listen_for_query(self):
+        """Listen for user query in a separate thread."""
+        try:
+            print("[Voice] Listening... Say something like 'red shirt' or 'blue bottle'")
+            self.speak("What are you looking for?", force=True)
+            
+            with self.microphone as source:
+                audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=5)
+            
+            query = self.recognizer.recognize_google(audio).lower()
+            print(f"[Voice] Heard: {query}")
+            self.parse_query(query)
+            
+        except sr.WaitTimeoutError:
+            print("[Voice] Listening timed out")
+            self.speak("I didn't hear anything", force=True)
+        except sr.UnknownValueError:
+            print("[Voice] Could not understand audio")
+            self.speak("I didn't understand that", force=True)
+        except sr.RequestError as e:
+            print(f"[Voice] Recognition error: {e}")
+        except Exception as e:
+            print(f"[Voice] Error: {e}")
+        finally:
+            self.is_listening = False
+    
+    def parse_query(self, query):
+        """Parse the search query to extract color and object."""
+        colors = ["red", "blue", "green", "yellow", "orange", "purple", "black", "white", "gray", "grey"]
+        
+        # Look for color in query
+        self.search_color = None
+        for color in colors:
+            if color in query:
+                self.search_color = color
+                break
+        
+        # The rest is assumed to be the object
+        words = query.split()
+        object_words = [w for w in words if w not in colors]
+        self.search_object = " ".join(object_words) if object_words else None
+        
+        if self.search_color or self.search_object:
+            search_desc = f"{self.search_color or ''} {self.search_object or ''}".strip()
+            self.speak(f"Looking for {search_desc}", force=True)
+            print(f"[Voice] Searching for - Color: {self.search_color}, Object: {self.search_object}")
+        else:
+            self.speak("I didn't understand what you're looking for", force=True)
+    
+    def start_listening_thread(self):
+        """Start listening in a background thread."""
+        if not self.is_listening:
+            self.is_listening = True
+            thread = threading.Thread(target=self.listen_for_query, daemon=True)
+            thread.start()
+    
+    def stop_search(self):
+        """Stop the current search."""
+        self.search_query = None
+        self.search_color = None
+        self.search_object = None
+        self.speak("Search stopped", force=True)
+        print("[Voice] Search stopped")
+
+
+def find_matching_objects(boxes, search_color, search_object):
+    """Find objects that match the search criteria."""
+    matches = []
+    
+    for box in boxes:
+        color_match = True
+        object_match = True
+        
+        # Check color match
+        if search_color:
+            color_match = box.get("color", "").lower() == search_color.lower()
+        
+        # Check object match (fuzzy matching)
+        if search_object:
+            object_name = box.get("cls_name", "").lower()
+            # Simple matching - check if search term is in object name or vice versa
+            object_match = (search_object in object_name) or (object_name in search_object)
+        
+        if color_match and object_match:
+            matches.append(box)
+    
+    return matches
+
+
+def generate_guidance(box, frame_width, frame_height):
+    """Generate spatial guidance based on object position and depth."""
+    mid_x = (box["x1"] + box["x2"]) // 2
+    mid_y = (box["y1"] + box["y2"]) // 2
+    
+    # Horizontal guidance (divide frame into left, center, right)
+    h_third = frame_width / 3
+    if mid_x < h_third:
+        h_dir = "left"
+    elif mid_x > 2 * h_third:
+        h_dir = "right"
+    else:
+        h_dir = "center"
+    
+    # Vertical guidance (divide frame into top, center, bottom)
+    v_third = frame_height / 3
+    if mid_y < v_third:
+        v_dir = "up"
+    elif mid_y > 2 * v_third:
+        v_dir = "down"
+    else:
+        v_dir = "middle"
+    
+    # Distance guidance
+    depth_m = box.get("depth_m", None)
+    if depth_m:
+        if depth_m < 0.5:
+            d_dir = "very close"
+        elif depth_m < 1.0:
+            d_dir = "close"
+        elif depth_m < 2.0:
+            d_dir = "within reach"
+        elif depth_m < 3.5:
+            d_dir = "a few feet away"
+        else:
+            d_dir = "far away"
+        
+        depth_text = f"{int(depth_m * 100)} centimeters, {d_dir}"
+    else:
+        depth_text = "distance unknown"
+    
+    # Build guidance string
+    position = []
+    if v_dir != "middle":
+        position.append(v_dir)
+    if h_dir != "center":
+        position.append(h_dir)
+    
+    if position:
+        position_text = " and ".join(position)
+    else:
+        position_text = "straight ahead"
+    
+    return position_text, depth_text
 
 
 # ---------- Main loop ----------
@@ -254,10 +487,21 @@ def main():
     ap.add_argument("--overlay", type=str, default="blend", choices=["blend", "side"], help="Depth overlay mode")
     ap.add_argument("--alpha", type=float, default=0.55, help="Depth blend alpha")
     ap.add_argument("--save", type=str, default="", help="Optional path to save output video (e.g., out.mp4)")
+    ap.add_argument("--no-voice", action="store_true", help="Disable voice assistant features")
     args = ap.parse_args()
 
     device = init_device(force_cpu=args.cpu)
     print(f"[Init] Device: {device}")
+    
+    # Initialize voice assistant
+    voice_assistant = None
+    if not args.no_voice:
+        try:
+            voice_assistant = VoiceAssistant()
+        except Exception as e:
+            print(f"[Init] Could not initialize voice assistant: {e}")
+            print("[Init] Running without voice features")
+    
     print("[Init] Loading YOLO:", args.yolo)
     yolo = init_yolo(args.yolo, device, half=not args.no_half)
     # Warm-up YOLO predictor on the chosen device once to avoid heavy setup during the first frame
@@ -304,8 +548,9 @@ def main():
     frame_idx = 0
     last_depth = None
     last_depth_cm = None
+    last_guidance_time = 0
 
-    window_name = "VisionAssist — YOLO + MiDaS (q=quit, d=depth, m=mode, r=rec, b=boxes, i=HUD)"
+    window_name = "VisionAssist — YOLO + MiDaS (q=quit, s=search, x=stop search, d=depth, b=boxes, i=HUD)"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, args.width, args.height)
 
@@ -323,6 +568,9 @@ def main():
             t0 = time.time()
             boxes = run_yolo(yolo, frame, imgsz=args.imgsz, conf=args.conf, device=device)
             yolo_times.append(time.time() - t0)
+            
+            # Add color detection to boxes
+            boxes = add_color_to_boxes(frame, boxes)
 
             # MiDaS (every N frames)
             # Decide whether to run MiDaS this frame
@@ -349,6 +597,37 @@ def main():
                     depth_vis = cv2.resize(last_depth_cm, (W, H), interpolation=cv2.INTER_LINEAR)
                     out_frame = np.hstack([out_frame, depth_vis])
 
+            # Voice-guided object search
+            search_matches = []
+            if voice_assistant and (voice_assistant.search_color or voice_assistant.search_object):
+                search_matches = find_matching_objects(boxes, voice_assistant.search_color, voice_assistant.search_object)
+                
+                if search_matches:
+                    # Find the closest match
+                    closest_match = min(search_matches, key=lambda b: b.get("depth_m", 999))
+                    
+                    # Generate and speak guidance
+                    current_time = time.time()
+                    if current_time - last_guidance_time >= 2.0:  # Provide guidance every 2 seconds
+                        position_text, depth_text = generate_guidance(closest_match, W, H)
+                        color_name = closest_match.get("color", "")
+                        object_name = closest_match.get("cls_name", "object")
+                        guidance = f"{color_name} {object_name}, {position_text}, {depth_text}"
+                        voice_assistant.speak(guidance)
+                        last_guidance_time = current_time
+                    
+                    # Highlight the target object with a different color
+                    x1, y1, x2, y2 = closest_match["x1"], closest_match["y1"], closest_match["x2"], closest_match["y2"]
+                    cv2.rectangle(out_frame[:, :W], (x1, y1), (x2, y2), (0, 255, 255), 4)  # Yellow highlight
+                    put_text(out_frame[:, :W], "TARGET", (x1 + 2, y1 - 25), scale=0.8, color=(0, 255, 255))
+                else:
+                    # No matches found
+                    current_time = time.time()
+                    if current_time - last_guidance_time >= 3.0:
+                        search_desc = f"{voice_assistant.search_color or ''} {voice_assistant.search_object or ''}".strip()
+                        voice_assistant.speak(f"I don't see the {search_desc}")
+                        last_guidance_time = current_time
+
             if show_boxes:
                 draw_boxes(out_frame[:, :W], boxes, depth=last_depth, depth_near=args.depth_near, depth_far=args.depth_far)  # draw on left panel if side-by-side
 
@@ -368,8 +647,15 @@ def main():
                     put_text(out_frame, f"Depth {np.mean(depth_times)*1000:5.1f} ms ({depth_freq})", (10, 62))
                 put_text(out_frame, f"Overlay: {overlay_mode}  Boxes: {'on' if show_boxes else 'off'}  Depth: {'on' if show_depth else 'off'}",
                          (10, 82))
-                # Add frame counter and depth update indicator
-                put_text(out_frame, f"Frame: {frame_idx}  Depth updated: {do_depth if 'do_depth' in locals() else 'N/A'}", (10, 102))
+                
+                # Voice assistant status
+                if voice_assistant:
+                    if voice_assistant.search_color or voice_assistant.search_object:
+                        search_desc = f"{voice_assistant.search_color or ''} {voice_assistant.search_object or ''}".strip()
+                        status_color = (0, 255, 255) if search_matches else (0, 165, 255)  # Yellow if found, orange if not
+                        put_text(out_frame, f"SEARCHING: {search_desc} (found: {len(search_matches)})", (10, 102), color=status_color)
+                    else:
+                        put_text(out_frame, "Press 's' to start voice search", (10, 102), color=(200, 200, 200))
 
             # Write & show
             if writer is not None:
@@ -379,6 +665,17 @@ def main():
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
+            elif key == ord('s'):
+                # Start voice search
+                if voice_assistant:
+                    voice_assistant.start_listening_thread()
+                else:
+                    print("[Warn] Voice assistant not available")
+            elif key == ord('x'):
+                # Stop current search
+                if voice_assistant:
+                    voice_assistant.stop_search()
+                    last_guidance_time = 0
             elif key == ord('d'):
                 show_depth = not show_depth
             elif key == ord('m'):
